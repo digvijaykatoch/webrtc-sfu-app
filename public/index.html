@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WebRTC SFU Demo</title>
+  <style>
+    #videos {
+      display: flex;
+      flex-wrap: wrap;
+    }
+    video {
+      width: 45%;
+      margin: 10px;
+      border: 2px solid black;
+    }
+    #roomList {
+      margin-bottom: 20px;
+    }
+    #roomName {
+      margin-bottom: 10px;
+    }
+    button {
+      margin-top: 10px;
+    }
+    .room-item {
+      margin: 5px;
+      padding: 5px;
+      background: #f0f0f0;
+      cursor: pointer;
+    }
+  </style>
+</head>
+<body>
+
+  <h1>WebRTC SFU Demo</h1>
+
+  <div id="roomList">
+    <h3>Available Rooms:</h3>
+    <div id="roomsContainer"></div>
+    <button onclick="createRoom()">Create New Room</button>
+    <div id="roomName">Current Room: None</div>
+  </div>
+
+  <div id="videos"></div>
+
+  <button id="leaveButton" style="display:none;" onclick="leaveRoom()">Leave Room</button>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    const socket = io();
+    const videosContainer = document.getElementById('videos');
+    const roomNameElement = document.getElementById('roomName');
+    const leaveButton = document.getElementById('leaveButton');
+    const roomsContainer = document.getElementById('roomsContainer');
+    let roomName = '';
+    let localStream = null;
+    let peerConnections = {};
+
+    // Setup video element for local user
+    function createVideoElement(isLocal = false) {
+      const video = document.createElement('video');
+      video.autoplay = true;
+      video.muted = isLocal;
+      return video;
+    }
+
+    // Setup user media (camera + mic)
+    async function setupLocalMedia() {
+      try {
+        localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        const localVideo = createVideoElement(true);
+        localVideo.srcObject = localStream;
+        videosContainer.appendChild(localVideo);
+        return localStream;
+      } catch (err) {
+        console.error('Error accessing media devices.', err);
+      }
+    }
+
+    // Handle socket.io events
+    socket.on('update-rooms', (rooms) => {
+      roomsContainer.innerHTML = '';
+      for (let room in rooms) {
+        const roomElement = document.createElement('div');
+        roomElement.textContent = `${room} (${rooms[room].length} users)`;
+        roomElement.classList.add('room-item');
+        roomElement.onclick = () => joinRoom(room);
+        roomsContainer.appendChild(roomElement);
+      }
+    });
+
+    socket.on('user-joined', (newUserId) => {
+      console.log(`New user joined: ${newUserId}`);
+      const remoteVideo = createVideoElement();
+      videosContainer.appendChild(remoteVideo);
+
+      peerConnections[newUserId] = new RTCPeerConnection({
+        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+      });
+
+      peerConnections[newUserId].onicecandidate = (event) => {
+        if (event.candidate) {
+          socket.emit('ice-candidate', {
+            candidate: event.candidate,
+            targetId: newUserId,
+            room: roomName
+          });
+        }
+      };
+
+      peerConnections[newUserId].ontrack = (event) => {
+        remoteVideo.srcObject = event.streams[0];
+      };
+
+      localStream.getTracks().forEach(track => {
+        peerConnections[newUserId].addTrack(track, localStream);
+      });
+
+      peerConnections[newUserId].createOffer()
+        .then(offer => {
+          return peerConnections[newUserId].setLocalDescription(offer);
+        })
+        .then(() => {
+          socket.emit('offer', { sdp: peerConnections[newUserId].localDescription, targetId: newUserId, room: roomName });
+        });
+    });
+
+    socket.on('offer', (data) => {
+      const { sdp, fromId } = data;
+      if (peerConnections[fromId]) {
+        const pc = peerConnections[fromId];
+        pc.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp }))
+          .then(() => {
+            return pc.createAnswer();
+          })
+          .then(answer => {
+            return pc.setLocalDescription(answer);
+          })
+          .then(() => {
+            socket.emit('answer', { sdp: pc.localDescription.sdp, fromId });
+          });
+      }
+    });
+
+    socket.on('answer', (data) => {
+      const { sdp, fromId } = data;
+      if (peerConnections[fromId]) {
+        peerConnections[fromId].setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp }));
+      }
+    });
+
+    socket.on('ice-candidate', (data) => {
+      const { candidate, targetId } = data;
+      if (peerConnections[targetId]) {
+        peerConnections[targetId].addIceCandidate(new RTCIceCandidate(candidate));
+      }
+    });
+
+    // Join an existing room
+    function joinRoom(selectedRoom) {
+      roomName = selectedRoom;
+      roomNameElement.textContent = `Current Room: ${roomName}`;
+      leaveButton.style.display = 'inline-block';
+      socket.emit('join', roomName);
+    }
+
+    // Create a new room
+    function createRoom() {
+      const newRoom = prompt('Enter room name:');
+      if (newRoom) {
+        roomName = newRoom;
+        roomNameElement.textContent = `Current Room: ${roomName}`;
+        leaveButton.style.display = 'inline-block';
+        socket.emit('join', roomName);
+      }
+    }
+
+    // Leave the room
+    function leaveRoom() {
+      socket.emit('leave', roomName);
+      for (const peerId in peerConnections) {
+        const pc = peerConnections[peerId];
+        pc.close();
+        delete peerConnections[peerId];
+      }
+      videosContainer.innerHTML = '';
+      setupLocalMedia().then(() => {
+        socket.emit('join', roomName);
+      });
+      roomNameElement.textContent = 'Current Room: None';
+      leaveButton.style.display = 'none';
+    }
+
+    // Get user media and join a room
+    setupLocalMedia();
+  </script>
+</body>
+</html>
